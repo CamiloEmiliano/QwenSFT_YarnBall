@@ -62,20 +62,27 @@ python3 train.py --dry-run
 - **Vast.ai Filters**: `datacenter: true` and `verified: true` (for security and 1+ Gbps fiber network).
 - **Estimated Run Time**: ~30–45 minutes (~$0.80–$1.50 total cost).
 
-### Provisioning via Vast.ai CLI:
+### Automated Datacenter Workflow (vast_runner.py):
+The included `vast_runner.py` enforces strict institutional security (`datacenter=true`, `verified=true`):
+
 ```bash
-# 1. Search for available A100 SXM instances
-vastai search offers 'gpu_name=A100_SXM4 datacenter=true verified=true num_gpus=1 rented=false' --order 'dph+'
+# 1. Search top verified datacenter offers (A100 SXM4 80GB)
+python vast_runner.py search --gpu A100_SXM4
 
-# 2. Create instance (replace <OFFER_ID> with desired offer ID)
-vastai create instance <OFFER_ID> \
-  --image pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel \
-  --disk 50 \
-  --ssh
+# 2. Dry-run provisioning check (no credit spent)
+python vast_runner.py launch --gpu A100_SXM4 --dry-run
 
-# 3. Connect to the instance via SSH:
-ssh -p <PORT> root@<IP>
+# 3. Provision instance (with confirmation prompt)
+python vast_runner.py launch --gpu A100_SXM4 --max-price 2.00
+
+# 4. Check instance status & SSH command
+python vast_runner.py status
+python vast_runner.py ssh
+
+# 5. Destroy instance once training completes (prevents idle billing)
+python vast_runner.py destroy <INSTANCE_ID>
 ```
+
 
 ### Execution Inside Vast.ai Container:
 ```bash

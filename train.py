@@ -19,16 +19,27 @@ import os
 from pathlib import Path
 import sys
 import yaml
-
-import torch
-from datasets import load_dataset
 from dotenv import load_dotenv
-from peft import LoraConfig, get_peft_model, TaskType
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-)
-from trl import DataCollatorForCompletionOnlyLM, SFTConfig, SFTTrainer
+
+# Deep Learning & Hugging Face imports (graceful fallback for local test runners)
+
+try:
+    import torch
+    from datasets import load_dataset
+    from peft import LoraConfig, TaskType
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from trl import DataCollatorForCompletionOnlyLM, SFTConfig, SFTTrainer
+except ImportError:
+    torch = None
+    load_dataset = None
+    LoraConfig = None
+    TaskType = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+    DataCollatorForCompletionOnlyLM = None
+    SFTConfig = None
+    SFTTrainer = None
+
 
 # Load local environment if present
 load_dotenv()
@@ -64,7 +75,9 @@ def get_attn_implementation() -> str:
 def format_dataset_to_chatml(batch: dict) -> dict:
     """Format prompt-completion pairs into Qwen2.5 ChatML format."""
     formatted_texts = []
-    for p, c in zip(batch["prompt"], batch["completion"]):
+    # Dataset schema uses 'target_completion' (with fallback to 'completion')
+    completions = batch.get("target_completion") or batch.get("completion") or []
+    for p, c in zip(batch["prompt"], completions):
         # Qwen2.5 native ChatML conversation format
         chatml_text = (
             f"<|im_start|>user\n{p.strip()}<|im_end|>\n"
@@ -72,6 +85,7 @@ def format_dataset_to_chatml(batch: dict) -> dict:
         )
         formatted_texts.append(chatml_text)
     return {"text": formatted_texts}
+
 
 
 def parse_args():
@@ -90,8 +104,15 @@ def parse_args():
 
 
 def main():
+    if torch is None or AutoModelForCausalLM is None:
+        raise ImportError(
+            "Deep learning dependencies (torch, transformers, trl, peft) are not installed in this environment. "
+            "Install them via 'pip install -r requirements.txt' or run inside the Vast.ai GPU container."
+        )
+
     args = parse_args()
     cfg = load_yaml_config(args.config)
+
 
     # Resolve settings from config + CLI args
     model_cfg = cfg.get("model", {})
