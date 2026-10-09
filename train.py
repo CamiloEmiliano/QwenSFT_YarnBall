@@ -15,6 +15,8 @@ over completion tokens (after '<|im_start|>assistant\\n').
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -27,7 +29,7 @@ try:
     import torch
     from datasets import load_dataset
     from peft import LoraConfig, TaskType
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
     from trl import DataCollatorForCompletionOnlyLM, SFTConfig, SFTTrainer
 except ImportError:
     torch = None
@@ -36,6 +38,7 @@ except ImportError:
     TaskType = None
     AutoModelForCausalLM = None
     AutoTokenizer = None
+    TrainerCallback = None
     DataCollatorForCompletionOnlyLM = None
     SFTConfig = None
     SFTTrainer = None
@@ -86,6 +89,80 @@ def format_dataset_to_chatml(batch: dict) -> dict:
         formatted_texts.append(chatml_text)
     return {"text": formatted_texts}
 
+
+class TrainingDynamicsCallback(TrainerCallback if TrainerCallback is not None else object):
+    """
+    Ripped and adapted from AllenAI's selection_utils.py:log_training_dynamics.
+    Records per-sample sequence probabilities and correctness across training epochs.
+    Computes sequence probability: exp(-mean_token_loss) over non-masked target tokens (label != -100).
+    """
+
+    def __init__(
+        self,
+        output_path: str = "artifacts/training_dynamics.jsonl",
+        correctness_threshold: float = 0.70,
+    ) -> None:
+        self.output_path = Path(output_path)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.correctness_threshold = correctness_threshold
+        # Clear previous run log if starting fresh
+        if self.output_path.exists():
+            self.output_path.unlink()
+
+    def on_epoch_end(self, args, state, control, model=None, eval_dataloader=None, **kwargs):
+        """Calculates per-sample target token log-likelihood on holdout/train probe."""
+        if eval_dataloader is None or model is None or torch is None:
+            return
+
+        model.eval()
+        epoch = int(round(state.epoch)) if state.epoch is not None else 1
+        records = []
+        batch_sample_offset = 0
+
+        with torch.no_grad():
+            for batch in eval_dataloader:
+                guids = batch.get("guid") or batch.get("sample_id")
+                input_ids = batch["input_ids"].to(model.device)
+                labels = batch["labels"].to(model.device)
+
+                batch_size = input_ids.size(0)
+                if guids is None:
+                    guids = [f"sample_{batch_sample_offset + i}" for i in range(batch_size)]
+                    batch_sample_offset += batch_size
+
+                outputs = model(input_ids=input_ids, labels=labels)
+                logits = outputs.logits  # [B, T, V]
+
+                # Compute per-sample loss over non-masked target tokens (label != -100)
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+
+                loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+                loss = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                ).view(shift_labels.size())
+
+                mask = (shift_labels != -100).float()
+                token_counts = mask.sum(dim=1).clamp(min=1.0)
+                per_sample_loss = (loss * mask).sum(dim=1) / token_counts
+
+                for guid, sample_loss in zip(guids, per_sample_loss.cpu().tolist()):
+                    seq_prob = math.exp(-sample_loss)
+                    is_correct = seq_prob >= self.correctness_threshold
+                    records.append({
+                        "epoch": epoch,
+                        "guid": str(guid),
+                        "seq_prob": round(seq_prob, 5),
+                        "is_correct": is_correct,
+                    })
+
+        with open(self.output_path, "a", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+        print(f"[TrainingDynamics] Logged dynamics for {len(records)} samples at epoch {epoch} -> {self.output_path}")
+        model.train()
 
 
 def parse_args():
@@ -238,8 +315,10 @@ def main():
         gradient_checkpointing=True,
     )
 
-    # 7. Initialize SFTTrainer
+    # 7. Initialize SFTTrainer with TrainingDynamicsCallback
     print("Initializing SFTTrainer...")
+    dynamics_output_path = os.path.join(output_dir, "training_dynamics.jsonl")
+    dynamics_callback = TrainingDynamicsCallback(output_path=dynamics_output_path)
     trainer = SFTTrainer(
         model=model,
         args=training_args,
@@ -248,6 +327,7 @@ def main():
         peft_config=peft_config,
         data_collator=collator,
         tokenizer=tokenizer,
+        callbacks=[dynamics_callback],
     )
 
     # 8. Train Execution
