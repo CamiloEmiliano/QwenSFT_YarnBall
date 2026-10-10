@@ -99,3 +99,21 @@ bash launch_vast.sh
 
 Upon completion, the LoRA adapter weights and tokenizer are automatically pushed to:
 `https://huggingface.co/CamiloEmiliano/yarnball-qwen-7b-lora`
+
+---
+
+## 5. Training Reports & Convergence Visualizations
+
+At the end of training, a comprehensive training report with diagnostic plots is automatically compiled to `outputs/yarnball-qwen-7b-lora/report/`:
+
+- **Headline Metrics**: Initial vs. final train loss, loss reduction %, validation perplexity, best checkpoint step, throughput.
+- **Visual Plots**:
+  - `training_dashboard.png`: 4-panel diagnostic (Loss curve, LR schedule, sequence probabilities across epochs, Dataset Cartography scatter map).
+  - Individual SVGs: `loss_curves.svg`, `learning_rate_schedule.svg`, `cartography_scatter.svg`.
+- **Report Documents**: `training_report.md` (GitHub-flavored Markdown) and `training_report.html` (interactive self-contained dashboard).
+
+### Standalone Report Generation
+You can also re-generate reports on any existing run:
+```bash
+python report.py --run-dir outputs/yarnball-qwen-7b-lora --output-dir artifacts/report
+```

@@ -349,6 +349,19 @@ def main():
             trainer.push_to_hub(commit_message="Add trained YarnBall Qwen2.5-7B LoRA adapter")
             tokenizer.push_to_hub(hub_model_id)
 
+    # 10. Generate Training Report & Convergence Plots
+    try:
+        from report import generate_training_report
+        print("\nGenerating training report and convergence plots...")
+        report_artifacts = generate_training_report(
+            run_dir=output_dir,
+            output_dir=os.path.join(output_dir, "report"),
+            config=cfg,
+        )
+        print(f"Training report compiled successfully -> {report_artifacts['markdown_report']}")
+    except Exception as exc:
+        print(f"Warning: Failed to compile training report: {exc}")
+
     print("\n" + "=" * 70)
     print("YARNBALL SFT RUN COMPLETED SUCCESSFULLY")
     print("=" * 70 + "\n")
