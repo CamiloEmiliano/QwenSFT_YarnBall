@@ -86,32 +86,41 @@ def extract_country(geolocation: str) -> str:
 
 
 def search_offers(
-    gpu_name: str = "A100_SXM4",
-    min_vram: int = 40,
-    max_dph: float = 2.50,
-    min_down: float = 100.0,
+    gpu_name: str = "any",
+    min_vram: int = 24,
+    max_dph: float = 3.50,
+    min_down: float = 50.0,
     country: Optional[str] = None,
     min_reliability: Optional[float] = None,
-    limit: int = 10,
+    datacenter_only: bool = False,
+    verified_only: bool = False,
+    limit: int = 25,
 ) -> List[Dict[str, Any]]:
-    """Query verified enterprise datacenter offers."""
+    """Query offers with flexible, relaxed defaults."""
     filters = [
-        "datacenter=true",
-        "verified=true",
         "num_gpus=1",
         "rented=false",
         f"gpu_ram >= {min_vram}",
         f"dph_total <= {max_dph}",
         f"inet_down >= {min_down}",
     ]
-    if gpu_name and gpu_name.lower() not in ("any", "all"):
-        filters.append(f"gpu_name={gpu_name}")
+    if datacenter_only:
+        filters.append("datacenter=true")
+    if verified_only:
+        filters.append("verified=true")
 
     query_str = " ".join(filters)
     cmd = ["search", "offers", query_str, "--order", "dph+"]
     raw = run_vast_cmd(cmd, raw_json=True)
     if isinstance(raw, list):
         filtered = raw
+        # Flexible GPU substring matching (e.g. 'A100' matches 'A100 PCIE', 'A100_SXM4', 'A100-80GB')
+        if gpu_name and gpu_name.lower() not in ("any", "all"):
+            target_gpu = gpu_name.strip().upper().replace("_", " ").replace("-", " ")
+            filtered = [
+                o for o in filtered
+                if target_gpu in str(o.get("gpu_name", "")).upper().replace("_", " ").replace("-", " ")
+            ]
         if country:
             country_target = country.strip().upper()
             filtered = [
@@ -120,7 +129,6 @@ def search_offers(
                 or country_target in str(o.get("geolocation", "")).upper()
             ]
         if min_reliability is not None:
-            # Handle percentage (e.g. 98 -> 0.98) or decimal (0.98)
             thresh = min_reliability / 100.0 if min_reliability > 1.0 else min_reliability
             filtered = [
                 o for o in filtered
@@ -160,13 +168,15 @@ def cmd_search(args: argparse.Namespace) -> None:
     country_msg = f", Country: {args.country}" if getattr(args, "country", None) else ""
     rel_val = getattr(args, "min_reliability", None)
     rel_msg = f", Min Rel: {rel_val:.1f}%" if rel_val is not None else ""
-    print(f"\nSearching verified datacenter offers (GPU: {args.gpu}, max ${args.max_price:.2f}/hr{country_msg}{rel_msg})...")
+    print(f"\nSearching available offers (GPU: {args.gpu}, max ${args.max_price:.2f}/hr{country_msg}{rel_msg})...")
     offers = search_offers(
         gpu_name=args.gpu,
         min_vram=args.min_vram,
         max_dph=args.max_price,
         country=args.country,
         min_reliability=args.min_reliability,
+        datacenter_only=args.datacenter,
+        verified_only=args.verified,
         limit=args.limit,
     )
     print("\n" + format_offers_table(offers) + "\n")
@@ -178,7 +188,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
 
     if not offer_id:
         print(f"Searching best available verified datacenter offer (GPU: {args.gpu}, max ${args.max_price:.2f}/hr)...")
-        offers = search_offers(gpu_name=args.gpu, min_vram=args.min_vram, max_dph=args.max_price, country=args.country, min_reliability=args.min_reliability, limit=1)
+        offers = search_offers(gpu_name=args.gpu, min_vram=args.min_vram, max_dph=args.max_price, country=args.country, min_reliability=args.min_reliability, datacenter_only=args.datacenter, verified_only=args.verified, limit=1)
         if not offers:
             print("No matching offers found. Try relaxing price ceiling with --max-price or changing --gpu.", file=sys.stderr)
             sys.exit(1)
@@ -292,23 +302,27 @@ def main():
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     # Subcommand: search
-    p_search = subparsers.add_parser("search", help="Search verified datacenter GPU instances")
-    p_search.add_argument("--gpu", default="A100_SXM4", help="GPU filter: A100_SXM4, A100_PCIE, A100, L40S, any")
-    p_search.add_argument("--min-vram", type=int, default=40, help="Minimum GPU VRAM in GB")
-    p_search.add_argument("--max-price", type=float, default=2.50, help="Maximum price per hour ceiling ($/hr)")
-    p_search.add_argument("--country", default=None, help="Filter by country code (e.g. US, CA, SE)")
+    p_search = subparsers.add_parser("search", help="Search available GPU instances")
+    p_search.add_argument("--gpu", default="any", help="GPU filter: A100, 4090, 6000, A5000, any")
+    p_search.add_argument("--min-vram", type=int, default=24, help="Minimum GPU VRAM in GB (default: 24)")
+    p_search.add_argument("--max-price", type=float, default=3.50, help="Maximum price per hour ceiling ($/hr)")
+    p_search.add_argument("--country", default=None, help="Filter by country code (e.g. US, GB, IE, SE)")
     p_search.add_argument("--min-reliability", type=float, default=None, help="Minimum host reliability percentage (e.g. 98 for 98%)")
-    p_search.add_argument("--limit", type=int, default=10, help="Max results to display")
+    p_search.add_argument("--datacenter", action="store_true", help="Restrict strictly to datacenter hosts")
+    p_search.add_argument("--verified", action="store_true", help="Restrict strictly to verified badge hosts")
+    p_search.add_argument("--limit", type=int, default=25, help="Max results to display (default: 25)")
     p_search.set_defaults(func=cmd_search)
 
     # Subcommand: launch
     p_launch = subparsers.add_parser("launch", help="Provision a verified datacenter instance")
     p_launch.add_argument("--offer-id", type=int, default=None, help="Specific offer ID to rent (optional)")
-    p_launch.add_argument("--gpu", default="A100_SXM4", help="GPU filter if offer-id is not specified")
-    p_launch.add_argument("--min-vram", type=int, default=40, help="Minimum GPU VRAM in GB")
-    p_launch.add_argument("--max-price", type=float, default=2.00, help="Maximum price per hour ceiling ($/hr)")
-    p_launch.add_argument("--country", default=None, help="Filter by country code (e.g. US, CA, SE)")
+    p_launch.add_argument("--gpu", default="any", help="GPU filter if offer-id is not specified")
+    p_launch.add_argument("--min-vram", type=int, default=24, help="Minimum GPU VRAM in GB (default: 24)")
+    p_launch.add_argument("--max-price", type=float, default=3.50, help="Maximum price per hour ceiling ($/hr)")
+    p_launch.add_argument("--country", default=None, help="Filter by country code (e.g. US, GB, IE, SE)")
     p_launch.add_argument("--min-reliability", type=float, default=95.0, help="Minimum host reliability percentage (default: 95.0%)")
+    p_launch.add_argument("--datacenter", action="store_true", help="Restrict strictly to datacenter hosts")
+    p_launch.add_argument("--verified", action="store_true", help="Restrict strictly to verified badge hosts")
     p_launch.add_argument("--disk", type=int, default=50, help="Local disk partition in GB")
     p_launch.add_argument("--image", default="pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel", help="Docker image")
     p_launch.add_argument("--auto-train", action="store_true", help="Automatically run training upon container boot")
