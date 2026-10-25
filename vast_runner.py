@@ -210,6 +210,7 @@ def normalize_compute_cap(val: Optional[float]) -> Optional[int]:
 def search_offers(
     gpu_name: str = "any",
     min_vram: int = 24,
+    min_disk: int = 40,
     max_dph: float = 3.50,
     min_down: float = 50.0,
     country: Optional[str] = None,
@@ -227,6 +228,7 @@ def search_offers(
         "num_gpus=1",
         "rented=false",
         f"gpu_ram >= {min_vram}",
+        f"disk_space >= {min_disk}",
         f"dph_total <= {max_dph}",
         f"inet_down >= {min_down}",
     ]
@@ -291,7 +293,7 @@ def format_offers_table(offers: List[Dict[str, Any]]) -> str:
     if not offers:
         return "No matching verified datacenter instances found within constraints."
 
-    header = f"{'Offer ID':<10} {'GPU Model':<18} {'VRAM':<8} {'$/hr':<8} {'DL (Mbps)':<10} {'Country':<8} {'Reliability':<12}"
+    header = f"{'Offer ID':<10} {'GPU Model':<18} {'VRAM':<8} {'Disk Space':<12} {'$/hr':<8} {'DL (Mbps)':<10} {'Country':<8} {'Reliability':<12}"
     lines = [header, "-" * len(header)]
 
     for o in offers:
@@ -300,12 +302,14 @@ def format_offers_table(offers: List[Dict[str, Any]]) -> str:
         raw_vram = float(o.get("gpu_ram", 0))
         vram_gb = raw_vram / 1024 if raw_vram > 500 else raw_vram
         vram = f"{vram_gb:.0f} GB"
+        raw_disk = float(o.get("disk_space", 0))
+        disk = f"{raw_disk:.0f} GB"
         dph = f"${float(o.get('dph_total', 0)):.2f}"
         down = f"{float(o.get('inet_down', 0)):.0f}"
         geo = str(o.get("geolocation", "-"))
         loc = extract_country(geo)
         rel = f"{float(o.get('reliability2', 0)) * 100:.1f}%"
-        lines.append(f"{oid:<10} {gpu:<18} {vram:<8} {dph:<8} {down:<10} {loc:<8} {rel:<12}")
+        lines.append(f"{oid:<10} {gpu:<18} {vram:<8} {disk:<12} {dph:<8} {down:<10} {loc:<8} {rel:<12}")
 
     return "\n".join(lines)
 
@@ -320,6 +324,7 @@ def cmd_search(args: argparse.Namespace) -> None:
     offers = search_offers(
         gpu_name=args.gpu,
         min_vram=args.min_vram,
+        min_disk=getattr(args, "min_disk", 40),
         max_dph=args.max_price,
         country=args.country,
         min_reliability=args.min_reliability,
@@ -470,6 +475,7 @@ def main():
     p_search = subparsers.add_parser("search", help="Search available GPU instances")
     p_search.add_argument("--gpu", default="any", help="GPU filter: A100, 4090, 6000, A5000, any")
     p_search.add_argument("--min-vram", type=int, default=24, help="Minimum GPU VRAM in GB (default: 24)")
+    p_search.add_argument("--min-disk", type=int, default=40, help="Minimum available disk space in GB (default: 40)")
     p_search.add_argument("--max-price", type=float, default=3.50, help="Maximum price per hour ceiling ($/hr)")
     p_search.add_argument("--country", default=None, help="Filter by country code (e.g. US, GB, IE, SE)")
     p_search.add_argument("--min-reliability", type=float, default=None, help="Minimum host reliability percentage (e.g. 98 for 98%%)")
