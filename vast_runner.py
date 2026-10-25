@@ -9,7 +9,7 @@ cloud GPUs on Vast.ai for fine-tuning the Qwen2.5-7B YarnBall financial model.
 Quickstart Workflow (4 Steps):
 ------------------------------
 1. Search for available GPUs:
-   python vast_runner.py search --gpu A100 --min-vram 80 --min-reliability 99.0
+   python vast_runner.py search --gpu A100 --min-vram 80 --min-disk 50 --min-reliability 99.0
 
 2. Launch and auto-train on your chosen Offer ID:
    python vast_runner.py launch --offer-id 32303769 --auto-train
@@ -36,6 +36,12 @@ Subcommands & Command-Line Options:
      --min-vram <GB>         Minimum GPU memory in Gigabytes.
                              Examples: 24 (RTX 4090 / A5000), 40 (A100-40GB), 80 (A100/H100-80GB).
                              Default: 24.
+
+     --min-disk <GB>         Minimum available host physical NVMe storage in Gigabytes.
+                             Guarantees the host has sufficient disk to store the 15 GB base model,
+                             PyTorch libraries, and checkpoint files without running out of disk.
+                             Examples: 40, 50, 100, 500.
+                             Default: 40.
 
      --max-price <$/hr>      Maximum hourly price ceiling in USD.
                              Examples: 1.50, 2.50, 3.50.
@@ -348,6 +354,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
         offers = search_offers(
             gpu_name=args.gpu,
             min_vram=args.min_vram,
+            min_disk=max(getattr(args, "min_disk", 40), getattr(args, "disk", 50)),
             max_dph=args.max_price,
             country=args.country,
             min_reliability=args.min_reliability,
@@ -493,6 +500,7 @@ def main():
     p_launch.add_argument("--offer-id", type=int, default=None, help="Specific offer ID to rent (optional)")
     p_launch.add_argument("--gpu", default="any", help="GPU filter if offer-id is not specified")
     p_launch.add_argument("--min-vram", type=int, default=24, help="Minimum GPU VRAM in GB (default: 24)")
+    p_launch.add_argument("--min-disk", type=int, default=40, help="Minimum host physical disk space in GB (default: 40)")
     p_launch.add_argument("--max-price", type=float, default=3.50, help="Maximum price per hour ceiling ($/hr)")
     p_launch.add_argument("--country", default=None, help="Filter by country code (e.g. US, GB, IE, SE)")
     p_launch.add_argument("--min-reliability", type=float, default=95.0, help="Minimum host reliability percentage (default: 95.0%%)")
