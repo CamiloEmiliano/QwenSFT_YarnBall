@@ -1,11 +1,121 @@
 #!/usr/bin/env python3
 """
-Automated Vast.ai Datacenter GPU Runner for QwenSFT_YarnBall.
+Vast.ai GPU Automation & Provisioning Runner for QwenSFT_YarnBall.
+==================================================================
 
-Enforces strict institutional security:
-- datacenter=true: strictly enterprise colocation facilities (zero residential miners).
-- verified=true: physically and network verified by Vast.ai.
-- Automated provisioning, SSH credential handling, training launch, and teardown.
+This script simplifies searching for, renting, training on, and terminating
+cloud GPUs on Vast.ai for fine-tuning the Qwen2.5-7B YarnBall financial model.
+
+Quickstart Workflow (4 Steps):
+------------------------------
+1. Search for available GPUs:
+   python vast_runner.py search --gpu A100 --min-vram 80 --min-reliability 99.0
+
+2. Launch and auto-train on your chosen Offer ID:
+   python vast_runner.py launch --offer-id 32303769 --auto-train
+
+3. Check instance status & SSH connection details:
+   python vast_runner.py status
+
+4. Destroy instance when training is complete (STOPS ALL BILLING):
+   python vast_runner.py destroy <INSTANCE_ID> -y
+
+
+Subcommands & Command-Line Options:
+-----------------------------------
+
+1. `search` - Find and filter available cloud GPU offers
+   -----------------------------------------------------
+   Usage: python vast_runner.py search [OPTIONS]
+
+   Filtering Options:
+     --gpu <NAME>            Filter GPU model name (case-insensitive substring).
+                             Examples: 'A100', 'H100', '4090', '6000', or 'any'.
+                             Default: 'any'.
+
+     --min-vram <GB>         Minimum GPU memory in Gigabytes.
+                             Examples: 24 (RTX 4090 / A5000), 40 (A100-40GB), 80 (A100/H100-80GB).
+                             Default: 24.
+
+     --max-price <$/hr>      Maximum hourly price ceiling in USD.
+                             Examples: 1.50, 2.50, 3.50.
+                             Default: 3.50.
+
+     --country <CODE>        Filter by 2-letter country code or geographic region.
+                             Examples: 'US' (United States), 'GB' (United Kingdom), 'SE' (Sweden), 'CZ'.
+                             Default: None (searches worldwide).
+
+     --min-reliability <PCT> Minimum host uptime reliability percentage.
+                             Examples: 98 (for 98%), 99.5.
+                             Default: None (displays all reliability levels).
+
+     --max-compute-cap <CAP> Maximum CUDA compute capability to avoid unvetted architectures.
+                             Tip: Use '900' (or '9.0') to strictly filter out Blackwell ('1200')
+                             while keeping Ampere ('800') and Hopper ('900') cards.
+                             Default: None.
+
+     --min-compute-cap <CAP> Minimum CUDA compute capability.
+                             Tip: Use '800' (or '8.0') to ensure modern Ampere/Hopper Tensor Cores
+                             and exclude older Volta/Turing architectures.
+                             Default: None.
+
+     --min-mem-bw <GB/s>     Minimum physical GPU memory bandwidth in GB/s.
+                             Tip: Setting to 1000 ensures high-speed HBM2e memory (A100/H100).
+                             Default: None.
+
+     --nvlink                Require high-speed NVLink interconnect (SXM4/SXM5 nodes).
+                             Filters out PCIe-only bus cards.
+
+     --datacenter            Restrict search strictly to institutional datacenter hosts.
+
+     --verified              Restrict search strictly to hosts verified by Vast.ai staff.
+
+     --limit <N>             Maximum number of offers to display in the table.
+                             Default: 25.
+
+
+2. `launch` - Provision an instance and start training
+   ----------------------------------------------------
+   Usage: python vast_runner.py launch [OPTIONS]
+
+   Launch Options:
+     --offer-id <ID>         The exact Offer ID chosen from the search table.
+                             (If omitted, the script automatically rents the cheapest offer
+                             matching your search criteria).
+
+     --auto-train            1-Click Autonomous Mode: Upon container boot, automatically
+                             clones the repository, installs dependencies, pulls Hugging Face
+                             credentials from .env, and executes the fine-tuning job in the
+                             background (logging to /workspace/QwenSFT_YarnBall/training.log).
+
+     --disk <GB>             Storage disk partition size in Gigabytes.
+                             Default: 50.
+
+     --image <DOCKER_IMAGE>  Docker base container image to deploy.
+                             Default: 'pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel'.
+
+     --dry-run               Simulates provisioning without actually renting or spending credits.
+
+     -y, --yes               Bypasses the interactive confirmation prompt.
+
+
+3. `status` - Check active instances
+   ---------------------------------
+   Usage: python vast_runner.py status
+   Displays Instance ID, run status (loading, running), GPU model, hourly cost,
+   and the ready-to-use SSH connection string.
+
+
+4. `ssh` - Connect to your running instance
+   ----------------------------------------
+   Usage: python vast_runner.py ssh [INSTANCE_ID]
+   Prints the exact SSH command to connect to your container terminal.
+
+
+5. `destroy` - Terminate an instance and stop billing
+   --------------------------------------------------
+   Usage: python vast_runner.py destroy <INSTANCE_ID> [-y]
+   Permanently deletes the container and immediately stops all billing charges.
 """
 
 from __future__ import annotations
@@ -85,6 +195,18 @@ def extract_country(geolocation: str) -> str:
     return parts[-1] if parts else "-"
 
 
+def normalize_compute_cap(val: Optional[float]) -> Optional[int]:
+    """Normalize compute capability (e.g. 8.0 -> 800, 80 -> 800, 800 -> 800)."""
+    if val is None:
+        return None
+    val_float = float(val)
+    if val_float < 15.0:
+        return int(round(val_float * 100))
+    elif val_float < 150.0:
+        return int(round(val_float * 10))
+    return int(round(val_float))
+
+
 def search_offers(
     gpu_name: str = "any",
     min_vram: int = 24,
@@ -94,6 +216,10 @@ def search_offers(
     min_reliability: Optional[float] = None,
     datacenter_only: bool = False,
     verified_only: bool = False,
+    min_compute_cap: Optional[float] = None,
+    max_compute_cap: Optional[float] = None,
+    min_mem_bw: Optional[float] = None,
+    nvlink_only: bool = False,
     limit: int = 25,
 ) -> List[Dict[str, Any]]:
     """Query offers with flexible, relaxed defaults."""
@@ -133,6 +259,28 @@ def search_offers(
             filtered = [
                 o for o in filtered
                 if float(o.get("reliability2", 0)) >= thresh
+            ]
+        if min_compute_cap is not None:
+            min_cap = normalize_compute_cap(min_compute_cap)
+            filtered = [
+                o for o in filtered
+                if int(o.get("compute_cap") or 0) >= min_cap
+            ]
+        if max_compute_cap is not None:
+            max_cap = normalize_compute_cap(max_compute_cap)
+            filtered = [
+                o for o in filtered
+                if int(o.get("compute_cap") or 0) <= max_cap
+            ]
+        if min_mem_bw is not None:
+            filtered = [
+                o for o in filtered
+                if float(o.get("gpu_mem_bw") or 0) >= float(min_mem_bw)
+            ]
+        if nvlink_only:
+            filtered = [
+                o for o in filtered
+                if float(o.get("bw_nvlink") or 0) > 0.0
             ]
         return filtered[:limit]
     return []
@@ -177,6 +325,10 @@ def cmd_search(args: argparse.Namespace) -> None:
         min_reliability=args.min_reliability,
         datacenter_only=args.datacenter,
         verified_only=args.verified,
+        min_compute_cap=getattr(args, "min_compute_cap", None),
+        max_compute_cap=getattr(args, "max_compute_cap", None),
+        min_mem_bw=getattr(args, "min_mem_bw", None),
+        nvlink_only=getattr(args, "nvlink", False),
         limit=args.limit,
     )
     print("\n" + format_offers_table(offers) + "\n")
@@ -188,7 +340,20 @@ def cmd_launch(args: argparse.Namespace) -> None:
 
     if not offer_id:
         print(f"Searching best available verified datacenter offer (GPU: {args.gpu}, max ${args.max_price:.2f}/hr)...")
-        offers = search_offers(gpu_name=args.gpu, min_vram=args.min_vram, max_dph=args.max_price, country=args.country, min_reliability=args.min_reliability, datacenter_only=args.datacenter, verified_only=args.verified, limit=1)
+        offers = search_offers(
+            gpu_name=args.gpu,
+            min_vram=args.min_vram,
+            max_dph=args.max_price,
+            country=args.country,
+            min_reliability=args.min_reliability,
+            datacenter_only=args.datacenter,
+            verified_only=args.verified,
+            min_compute_cap=getattr(args, "min_compute_cap", None),
+            max_compute_cap=getattr(args, "max_compute_cap", None),
+            min_mem_bw=getattr(args, "min_mem_bw", None),
+            nvlink_only=getattr(args, "nvlink", False),
+            limit=1,
+        )
         if not offers:
             print("No matching offers found. Try relaxing price ceiling with --max-price or changing --gpu.", file=sys.stderr)
             sys.exit(1)
@@ -307,9 +472,13 @@ def main():
     p_search.add_argument("--min-vram", type=int, default=24, help="Minimum GPU VRAM in GB (default: 24)")
     p_search.add_argument("--max-price", type=float, default=3.50, help="Maximum price per hour ceiling ($/hr)")
     p_search.add_argument("--country", default=None, help="Filter by country code (e.g. US, GB, IE, SE)")
-    p_search.add_argument("--min-reliability", type=float, default=None, help="Minimum host reliability percentage (e.g. 98 for 98%)")
+    p_search.add_argument("--min-reliability", type=float, default=None, help="Minimum host reliability percentage (e.g. 98 for 98%%)")
     p_search.add_argument("--datacenter", action="store_true", help="Restrict strictly to datacenter hosts")
     p_search.add_argument("--verified", action="store_true", help="Restrict strictly to verified badge hosts")
+    p_search.add_argument("--min-compute-cap", type=float, default=None, help="Minimum CUDA compute capability (e.g. 8.0, 80, or 800 for Ampere)")
+    p_search.add_argument("--max-compute-cap", type=float, default=None, help="Maximum CUDA compute capability (e.g. 9.0, 90, or 900 to exclude Blackwell)")
+    p_search.add_argument("--min-mem-bw", type=float, default=None, help="Minimum GPU memory bandwidth in GB/s (e.g. 1000 for HBM2e)")
+    p_search.add_argument("--nvlink", action="store_true", help="Require NVLink interconnect (SXM4/SXM5)")
     p_search.add_argument("--limit", type=int, default=25, help="Max results to display (default: 25)")
     p_search.set_defaults(func=cmd_search)
 
@@ -320,9 +489,13 @@ def main():
     p_launch.add_argument("--min-vram", type=int, default=24, help="Minimum GPU VRAM in GB (default: 24)")
     p_launch.add_argument("--max-price", type=float, default=3.50, help="Maximum price per hour ceiling ($/hr)")
     p_launch.add_argument("--country", default=None, help="Filter by country code (e.g. US, GB, IE, SE)")
-    p_launch.add_argument("--min-reliability", type=float, default=95.0, help="Minimum host reliability percentage (default: 95.0%)")
+    p_launch.add_argument("--min-reliability", type=float, default=95.0, help="Minimum host reliability percentage (default: 95.0%%)")
     p_launch.add_argument("--datacenter", action="store_true", help="Restrict strictly to datacenter hosts")
     p_launch.add_argument("--verified", action="store_true", help="Restrict strictly to verified badge hosts")
+    p_launch.add_argument("--min-compute-cap", type=float, default=None, help="Minimum CUDA compute capability")
+    p_launch.add_argument("--max-compute-cap", type=float, default=None, help="Maximum CUDA compute capability (e.g. 900 to exclude Blackwell)")
+    p_launch.add_argument("--min-mem-bw", type=float, default=None, help="Minimum GPU memory bandwidth in GB/s")
+    p_launch.add_argument("--nvlink", action="store_true", help="Require NVLink interconnect")
     p_launch.add_argument("--disk", type=int, default=50, help="Local disk partition in GB")
     p_launch.add_argument("--image", default="pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel", help="Docker image")
     p_launch.add_argument("--auto-train", action="store_true", help="Automatically run training upon container boot")
