@@ -77,11 +77,21 @@ def run_vast_cmd(cmd_args: List[str], raw_json: bool = True) -> Any:
     return out
 
 
+def extract_country(geolocation: str) -> str:
+    """Extract 2-letter country code or clean location from geolocation string."""
+    if not geolocation or not isinstance(geolocation, str):
+        return "-"
+    parts = [p.strip() for p in geolocation.split(",") if p.strip()]
+    return parts[-1] if parts else "-"
+
+
 def search_offers(
     gpu_name: str = "A100_SXM4",
     min_vram: int = 40,
     max_dph: float = 2.50,
     min_down: float = 100.0,
+    country: Optional[str] = None,
+    min_reliability: Optional[float] = None,
     limit: int = 10,
 ) -> List[Dict[str, Any]]:
     """Query verified enterprise datacenter offers."""
@@ -101,7 +111,22 @@ def search_offers(
     cmd = ["search", "offers", query_str, "--order", "dph+"]
     raw = run_vast_cmd(cmd, raw_json=True)
     if isinstance(raw, list):
-        return raw[:limit]
+        filtered = raw
+        if country:
+            country_target = country.strip().upper()
+            filtered = [
+                o for o in filtered
+                if extract_country(str(o.get("geolocation", ""))).upper() == country_target
+                or country_target in str(o.get("geolocation", "")).upper()
+            ]
+        if min_reliability is not None:
+            # Handle percentage (e.g. 98 -> 0.98) or decimal (0.98)
+            thresh = min_reliability / 100.0 if min_reliability > 1.0 else min_reliability
+            filtered = [
+                o for o in filtered
+                if float(o.get("reliability2", 0)) >= thresh
+            ]
+        return filtered[:limit]
     return []
 
 
@@ -121,9 +146,10 @@ def format_offers_table(offers: List[Dict[str, Any]]) -> str:
         vram = f"{vram_gb:.0f} GB"
         dph = f"${float(o.get('dph_total', 0)):.2f}"
         down = f"{float(o.get('inet_down', 0)):.0f}"
-        country = str(o.get("country", "-"))[:7]
+        geo = str(o.get("geolocation", "-"))
+        loc = extract_country(geo)
         rel = f"{float(o.get('reliability2', 0)) * 100:.1f}%"
-        lines.append(f"{oid:<10} {gpu:<18} {vram:<8} {dph:<8} {down:<10} {country:<8} {rel:<12}")
+        lines.append(f"{oid:<10} {gpu:<18} {vram:<8} {dph:<8} {down:<10} {loc:<8} {rel:<12}")
 
     return "\n".join(lines)
 
@@ -131,11 +157,16 @@ def format_offers_table(offers: List[Dict[str, Any]]) -> str:
 
 def cmd_search(args: argparse.Namespace) -> None:
     """Handle 'search' subcommand."""
-    print(f"\nSearching verified datacenter offers (GPU: {args.gpu}, max ${args.max_price:.2f}/hr)...")
+    country_msg = f", Country: {args.country}" if getattr(args, "country", None) else ""
+    rel_val = getattr(args, "min_reliability", None)
+    rel_msg = f", Min Rel: {rel_val:.1f}%" if rel_val is not None else ""
+    print(f"\nSearching verified datacenter offers (GPU: {args.gpu}, max ${args.max_price:.2f}/hr{country_msg}{rel_msg})...")
     offers = search_offers(
         gpu_name=args.gpu,
         min_vram=args.min_vram,
         max_dph=args.max_price,
+        country=args.country,
+        min_reliability=args.min_reliability,
         limit=args.limit,
     )
     print("\n" + format_offers_table(offers) + "\n")
@@ -147,7 +178,7 @@ def cmd_launch(args: argparse.Namespace) -> None:
 
     if not offer_id:
         print(f"Searching best available verified datacenter offer (GPU: {args.gpu}, max ${args.max_price:.2f}/hr)...")
-        offers = search_offers(gpu_name=args.gpu, min_vram=args.min_vram, max_dph=args.max_price, limit=1)
+        offers = search_offers(gpu_name=args.gpu, min_vram=args.min_vram, max_dph=args.max_price, country=args.country, min_reliability=args.min_reliability, limit=1)
         if not offers:
             print("No matching offers found. Try relaxing price ceiling with --max-price or changing --gpu.", file=sys.stderr)
             sys.exit(1)
@@ -265,6 +296,8 @@ def main():
     p_search.add_argument("--gpu", default="A100_SXM4", help="GPU filter: A100_SXM4, A100_PCIE, A100, L40S, any")
     p_search.add_argument("--min-vram", type=int, default=40, help="Minimum GPU VRAM in GB")
     p_search.add_argument("--max-price", type=float, default=2.50, help="Maximum price per hour ceiling ($/hr)")
+    p_search.add_argument("--country", default=None, help="Filter by country code (e.g. US, CA, SE)")
+    p_search.add_argument("--min-reliability", type=float, default=None, help="Minimum host reliability percentage (e.g. 98 for 98%)")
     p_search.add_argument("--limit", type=int, default=10, help="Max results to display")
     p_search.set_defaults(func=cmd_search)
 
@@ -274,6 +307,8 @@ def main():
     p_launch.add_argument("--gpu", default="A100_SXM4", help="GPU filter if offer-id is not specified")
     p_launch.add_argument("--min-vram", type=int, default=40, help="Minimum GPU VRAM in GB")
     p_launch.add_argument("--max-price", type=float, default=2.00, help="Maximum price per hour ceiling ($/hr)")
+    p_launch.add_argument("--country", default=None, help="Filter by country code (e.g. US, CA, SE)")
+    p_launch.add_argument("--min-reliability", type=float, default=95.0, help="Minimum host reliability percentage (default: 95.0%)")
     p_launch.add_argument("--disk", type=int, default=50, help="Local disk partition in GB")
     p_launch.add_argument("--image", default="pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel", help="Docker image")
     p_launch.add_argument("--auto-train", action="store_true", help="Automatically run training upon container boot")
