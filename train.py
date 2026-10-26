@@ -18,6 +18,7 @@ import argparse
 import json
 import math
 import os
+from typing import Any, Dict, List, Optional, Set, Tuple
 from pathlib import Path
 import sys
 import yaml
@@ -93,44 +94,146 @@ def format_dataset_to_chatml(batch: dict) -> dict:
 class TrainingDynamicsCallback(TrainerCallback if TrainerCallback is not None else object):
     """
     Ripped and adapted from AllenAI's selection_utils.py:log_training_dynamics.
-    Records per-sample sequence probabilities and correctness across training epochs.
-    Computes sequence probability: exp(-mean_token_loss) over non-masked target tokens (label != -100).
+    Upgraded for YarnBall SFT v2:
+    - Step 0 Baseline Probe (on_train_begin) to record zero-shot foundation model priors.
+    - Sub-Epoch Early Step Schedule (e.g. [0, 25, 50, 100, 200, 400, 600, 936]) to track learning velocity.
+    - Focal Payload Token Masking: excludes static template boilerplate tokens (structural JSON
+      brackets/keys and static Cypher keywords) to prevent formatting fluency from diluting
+      payload extraction & reasoning error signals.
     """
 
     def __init__(
         self,
         output_path: str = "artifacts/training_dynamics.jsonl",
         correctness_threshold: float = 0.70,
+        tokenizer: Optional[Any] = None,
+        probe_steps: Optional[List[int]] = None,
+        max_probe_samples: Optional[int] = None,
     ) -> None:
         self.output_path = Path(output_path)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.correctness_threshold = correctness_threshold
+        self.tokenizer = tokenizer
+        self.probe_steps = set(probe_steps) if probe_steps else None
+        self.max_probe_samples = max_probe_samples
+        self.trainer = None
+        self.logged_steps: Set[int] = set()
+        self.boilerplate_token_ids = self._build_boilerplate_tokens()
+
         # Clear previous run log if starting fresh
         if self.output_path.exists():
             self.output_path.unlink()
 
-    def on_epoch_end(self, args, state, control, model=None, eval_dataloader=None, **kwargs):
-        """Calculates per-sample target token log-likelihood on holdout/train probe."""
-        if eval_dataloader is None or model is None or torch is None:
+    def set_trainer(self, trainer: Any) -> None:
+        """Binds the active trainer instance and pre-computes boilerplate tokens."""
+        self.trainer = trainer
+        if self.tokenizer is None and hasattr(trainer, "tokenizer") and trainer.tokenizer is not None:
+            self.tokenizer = trainer.tokenizer
+            self.boilerplate_token_ids = self._build_boilerplate_tokens()
+
+    def _build_boilerplate_tokens(self) -> Set[int]:
+        """Pre-computes token IDs for static JSON syntax, whitespace, and standard Cypher keywords."""
+        if self.tokenizer is None:
+            return set()
+
+        boilerplate_patterns = [
+            "{", "}", "[", "]", ":", ",", '"', "'", "\n", " ", "  ", "    ",
+            '{"', '"}', '":', '",', '["', '"]', '},', '],', '{\n', '}\n',
+            "MATCH", "WHERE", "RETURN", "WITH", "AS", "AND", "OR", "IN",
+            " match", " where", " return", " with", " as", " and", " or", " in",
+            "MATCH (", "WHERE ", "RETURN ", "->", "<-", "-",
+            "<|im_start|>", "<|im_end|>", "assistant", "user", "\nassistant\n",
+            "entities", "type", "relationship", "properties", "name", "cik"
+        ]
+        b_ids = set()
+        for pattern in boilerplate_patterns:
+            try:
+                ids = self.tokenizer.encode(pattern, add_special_tokens=False)
+                b_ids.update(ids)
+            except Exception:
+                pass
+        return b_ids
+
+    def _should_probe_step(self, step: int, max_steps: int) -> bool:
+        """Determines whether a probe evaluation should occur at the given global step."""
+        if self.probe_steps is not None:
+            return step in self.probe_steps
+
+        # Default dynamic schedule: dense early checkpoints + major milestones
+        if max_steps <= 10:
+            return True  # Probe all steps during smoke tests/dry runs
+
+        default_checkpoints = {25, 50, 100, 200, 400, 600, max_steps}
+        return step in default_checkpoints
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        """Step 0: Evaluate zero-shot foundation model prior before any gradient updates."""
+        if 0 not in self.logged_steps:
+            self._evaluate_probe(step=0, epoch=0.0, model=model)
+            self.logged_steps.add(0)
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        """Evaluates probe at defined early step checkpoints."""
+        step = state.global_step
+        if step > 0 and self._should_probe_step(step, state.max_steps):
+            if step not in self.logged_steps:
+                self._evaluate_probe(step=step, epoch=state.epoch or 0.0, model=model)
+                self.logged_steps.add(step)
+
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        """Ensures epoch boundary checkpoints are captured."""
+        step = state.global_step
+        if step not in self.logged_steps:
+            self._evaluate_probe(step=step, epoch=state.epoch or 0.0, model=model)
+            self.logged_steps.add(step)
+
+    def _evaluate_probe(self, step: int, epoch: float, model: Any = None):
+        """Executes probe over validation dataloader with focal token masking."""
+        if self.trainer is None or torch is None:
             return
 
-        model.eval()
-        epoch = int(round(state.epoch)) if state.epoch is not None else 1
+        try:
+            eval_dataloader = self.trainer.get_eval_dataloader()
+        except Exception as e:
+            print(f"[TrainingDynamics] Warning: Could not retrieve eval_dataloader: {e}")
+            return
+
+        if eval_dataloader is None:
+            return
+
+        active_model = model if model is not None else self.trainer.model
+        was_training = getattr(active_model, "training", False)
+        active_model.eval()
+
         records = []
         batch_sample_offset = 0
+
+        # Build boilerplate tensor on model's device
+        boilerplate_tensor = None
+        if self.boilerplate_token_ids:
+            try:
+                device = getattr(active_model, "device", torch.device("cpu"))
+                boilerplate_tensor = torch.tensor(
+                    list(self.boilerplate_token_ids),
+                    dtype=torch.long,
+                    device=device,
+                )
+            except Exception:
+                boilerplate_tensor = None
 
         with torch.no_grad():
             for batch in eval_dataloader:
                 guids = batch.get("guid") or batch.get("sample_id")
-                input_ids = batch["input_ids"].to(model.device)
-                labels = batch["labels"].to(model.device)
+                device = getattr(active_model, "device", torch.device("cpu"))
+                input_ids = batch["input_ids"].to(device)
+                labels = batch["labels"].to(device)
 
                 batch_size = input_ids.size(0)
                 if guids is None:
                     guids = [f"sample_{batch_sample_offset + i}" for i in range(batch_size)]
                     batch_sample_offset += batch_size
 
-                outputs = model(input_ids=input_ids, labels=labels)
+                outputs = active_model(input_ids=input_ids, labels=labels)
                 logits = outputs.logits  # [B, T, V]
 
                 # Compute per-sample loss over non-masked target tokens (label != -100)
@@ -138,31 +241,56 @@ class TrainingDynamicsCallback(TrainerCallback if TrainerCallback is not None el
                 shift_labels = labels[..., 1:].contiguous()
 
                 loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-                loss = loss_fct(
+                token_losses = loss_fct(
                     shift_logits.view(-1, shift_logits.size(-1)),
                     shift_labels.view(-1),
                 ).view(shift_labels.size())
 
-                mask = (shift_labels != -100).float()
-                token_counts = mask.sum(dim=1).clamp(min=1.0)
-                per_sample_loss = (loss * mask).sum(dim=1) / token_counts
+                # Standard target token mask (label != -100)
+                standard_mask = (shift_labels != -100)
+
+                # Focal payload mask (excludes boilerplate tokens)
+                if boilerplate_tensor is not None and boilerplate_tensor.numel() > 0:
+                    is_boilerplate = torch.isin(shift_labels, boilerplate_tensor)
+                    focal_mask = standard_mask & (~is_boilerplate)
+                else:
+                    focal_mask = standard_mask
+
+                # For samples where focal_mask is completely empty, fallback to standard mask
+                has_focal = focal_mask.sum(dim=1) > 0
+                effective_mask = torch.where(has_focal.unsqueeze(1), focal_mask, standard_mask).float()
+
+                token_counts = effective_mask.sum(dim=1).clamp(min=1.0)
+                per_sample_loss = (token_losses * effective_mask).sum(dim=1) / token_counts
 
                 for guid, sample_loss in zip(guids, per_sample_loss.cpu().tolist()):
-                    seq_prob = math.exp(-sample_loss)
+                    safe_loss = min(100.0, max(0.0, float(sample_loss)))
+                    seq_prob = math.exp(-safe_loss)
                     is_correct = seq_prob >= self.correctness_threshold
                     records.append({
-                        "epoch": epoch,
+                        "step": int(step),
+                        "epoch": round(float(epoch), 3),
                         "guid": str(guid),
                         "seq_prob": round(seq_prob, 5),
+                        "loss": round(safe_loss, 4),
                         "is_correct": is_correct,
                     })
+
+                if self.max_probe_samples and len(records) >= self.max_probe_samples:
+                    records = records[:self.max_probe_samples]
+                    break
 
         with open(self.output_path, "a", encoding="utf-8") as f:
             for r in records:
                 f.write(json.dumps(r) + "\n")
 
-        print(f"[TrainingDynamics] Logged dynamics for {len(records)} samples at epoch {epoch} -> {self.output_path}")
-        model.train()
+        print(
+            f"[TrainingDynamics] Logged dynamics for {len(records)} samples at "
+            f"Step {step} (Epoch {epoch:.2f}) -> {self.output_path}"
+        )
+
+        if was_training:
+            active_model.train()
 
 
 def parse_args():
@@ -329,6 +457,7 @@ def main():
         tokenizer=tokenizer,
         callbacks=[dynamics_callback],
     )
+    dynamics_callback.set_trainer(trainer)
 
     # 8. Train Execution
     print("\nStarting SFT Training Run...")

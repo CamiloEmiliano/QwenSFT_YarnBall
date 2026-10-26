@@ -37,10 +37,10 @@ def compute_cartography_coordinates(
     """
     Computes per-sample confidence, variability, and correctness from sequence probabilities.
     
-    Coordinates:
-    - Confidence: mean(seq_prob) across epochs
-    - Variability: std(seq_prob) across epochs
-    - Correctness: fraction of epochs where is_correct is True
+    Coordinates (Swayamdipta et al., EMNLP 2020):
+    - Confidence: mean(seq_prob) across tracked checkpoints (Step 0 through final step).
+    - Variability: std(seq_prob) across tracked checkpoints.
+    - Correctness: fraction of checkpoints where is_correct is True.
     """
     by_guid: Dict[str, List[Dict[str, Any]]] = {}
     for r in dynamics_records:
@@ -50,8 +50,10 @@ def compute_cartography_coordinates(
 
     coordinates: Dict[str, Dict[str, Any]] = {}
     for guid, samples in by_guid.items():
-        probs = [float(s.get("seq_prob", 0.0)) for s in samples]
-        corrects = [1.0 if s.get("is_correct") else 0.0 for s in samples]
+        # Sort by step / epoch to ensure chronological trajectory
+        samples_sorted = sorted(samples, key=lambda s: (s.get("step", 0), s.get("epoch", 0.0)))
+        probs = [float(s.get("seq_prob", 0.0)) for s in samples_sorted]
+        corrects = [1.0 if s.get("is_correct") else 0.0 for s in samples_sorted]
         n = len(probs)
         if n == 0:
             continue
@@ -75,7 +77,9 @@ def compute_cartography_coordinates(
             "variability": round(std_prob, 4),
             "correctness": round(correctness, 4),
             "region": region,
-            "epochs_tracked": n,
+            "checkpoints_tracked": n,
+            "initial_prob": round(probs[0], 5) if probs else 0.0,
+            "final_prob": round(probs[-1], 5) if probs else 0.0,
         }
 
     return coordinates
@@ -341,6 +345,15 @@ class PureSVGPlotter:
         content.append(f'<text x="{W/2}" y="{H - 15}" text-anchor="middle" class="axis-label">Variability (std)</text>')
         content.append(f'<text x="20" y="{H/2}" transform="rotate(-90 20 {H/2})" text-anchor="middle" class="axis-label">Confidence (mean seq_prob)</text>')
 
+        # Swayamdipta Threshold Boundary Lines
+        amb_x = pad_l + (0.15 / 0.5) * plot_w
+        easy_y = pad_t + plot_h - (0.70 * plot_h)
+        content.append(f'<line x1="{amb_x:.1f}" y1="{pad_t}" x2="{amb_x:.1f}" y2="{H - pad_b}" stroke="#ffea00" stroke-width="1.5" stroke-dasharray="4,4" opacity="0.65"/>')
+        content.append(f'<text x="{amb_x + 5:.1f}" y="{pad_t + 16}" fill="#ffea00" font-size="10" opacity="0.85">Ambiguous (std >= 0.15)</text>')
+        content.append(f'<line x1="{pad_l}" y1="{easy_y:.1f}" x2="{amb_x:.1f}" y2="{easy_y:.1f}" stroke="#00e676" stroke-width="1.5" stroke-dasharray="4,4" opacity="0.65"/>')
+        content.append(f'<text x="{pad_l + 8}" y="{easy_y - 6:.1f}" fill="#00e676" font-size="10" opacity="0.85">Easy-to-Learn (conf >= 0.70)</text>')
+        content.append(f'<text x="{pad_l + 8}" y="{easy_y + 14:.1f}" fill="#ff1744" font-size="10" opacity="0.85">Hard-to-Learn (conf < 0.70)</text>')
+
         for coord in coordinates.values():
             var = min(0.5, max(0.0, coord.get("variability", 0.0)))
             conf = min(1.0, max(0.0, coord.get("confidence", 0.0)))
@@ -400,7 +413,7 @@ class MatplotlibPlotter:
         eval_perplexities: List[float],
         lr_steps: List[int],
         learning_rates: List[float],
-        dynamics_by_epoch: Dict[int, Dict[str, float]],
+        ckpt_stats: Dict[str, Dict[str, float]],
         coordinates: Dict[str, Dict[str, Any]],
         output_path: Path,
     ) -> None:
@@ -463,23 +476,23 @@ class MatplotlibPlotter:
         ax2.legend(loc="upper right")
 
         # -------------------------------------------------------------
-        # Subplot 3: Per-Epoch Sequence Probabilities
+        # Subplot 3: Checkpoint Sequence Probabilities
         # -------------------------------------------------------------
         ax3 = axes[1, 0]
-        epochs = sorted(dynamics_by_epoch.keys())
-        if epochs:
-            mean_probs = [dynamics_by_epoch[e].get("mean_prob", 0.0) for e in epochs]
-            pass_rates = [dynamics_by_epoch[e].get("pass_rate", 0.0) for e in epochs]
-            x_indices = range(len(epochs))
+        ckpts = list(ckpt_stats.keys())
+        if ckpts:
+            mean_probs = [ckpt_stats[k].get("mean_prob", 0.0) for k in ckpts]
+            pass_rates = [ckpt_stats[k].get("pass_rate", 0.0) for k in ckpts]
+            x_indices = range(len(ckpts))
             bar_width = 0.35
 
             ax3.bar([x - bar_width/2 for x in x_indices], mean_probs, width=bar_width, color="#00bcd4", label="Mean Target Seq Prob")
             ax3.bar([x + bar_width/2 for x in x_indices], pass_rates, width=bar_width, color="#4caf50", label="Correctness Pass Rate")
             ax3.set_xticks(list(x_indices))
-            ax3.set_xticklabels([f"Epoch {e}" for e in epochs])
+            ax3.set_xticklabels(ckpts, rotation=25, ha="right", fontsize=9)
             ax3.set_ylim(0.0, 1.05)
-        ax3.set_title("Training Dynamics across Epochs", fontsize=13, fontweight="bold", color="#d1d4dc")
-        ax3.set_xlabel("Training Epoch")
+        ax3.set_title("Training Dynamics across Checkpoints", fontsize=13, fontweight="bold", color="#d1d4dc")
+        ax3.set_xlabel("Evaluation Checkpoint")
         ax3.set_ylabel("Probability / Accuracy Metric")
         ax3.grid(True)
         ax3.legend(loc="lower right")
@@ -500,6 +513,8 @@ class MatplotlibPlotter:
                 if xs:
                     ax4.scatter(xs, ys, c=color, label=f"{region} (n={len(xs)})", alpha=0.65, edgecolors="none", s=25)
 
+        ax4.axvline(0.15, color="#ffea00", linestyle="--", linewidth=1.5, alpha=0.7, label="Ambiguous Bound (std=0.15)")
+        ax4.plot([0.0, 0.15], [0.70, 0.70], color="#00e676", linestyle="--", linewidth=1.5, alpha=0.7, label="Easy Bound (conf=0.70)")
         ax4.set_title("Dataset Cartography Map", fontsize=13, fontweight="bold", color="#d1d4dc")
         ax4.set_xlabel("Variability (std)")
         ax4.set_ylabel("Confidence (mean seq_prob)")
@@ -697,18 +712,24 @@ class TrainingReportGenerator:
         time_series = self.extract_time_series(log_history)
         coordinates = compute_cartography_coordinates(dynamics_records)
 
-        dynamics_by_epoch: Dict[int, Dict[str, float]] = {}
+        dynamics_by_ckpt: Dict[str, Dict[str, float]] = {}
         for r in dynamics_records:
-            ep = int(r.get("epoch", 1))
-            dynamics_by_epoch.setdefault(ep, {"probs": [], "corrects": []})
-            dynamics_by_epoch[ep]["probs"].append(float(r.get("seq_prob", 0.0)))
-            dynamics_by_epoch[ep]["corrects"].append(1.0 if r.get("is_correct") else 0.0)
+            st = r.get("step")
+            ep = r.get("epoch", 0.0)
+            if st is not None:
+                lbl = f"Step {st} (Epoch {float(ep):.2f})"
+            else:
+                lbl = f"Epoch {int(ep)}"
 
-        epoch_stats: Dict[int, Dict[str, float]] = {}
-        for ep, d in dynamics_by_epoch.items():
+            dynamics_by_ckpt.setdefault(lbl, {"probs": [], "corrects": []})
+            dynamics_by_ckpt[lbl]["probs"].append(float(r.get("seq_prob", 0.0)))
+            dynamics_by_ckpt[lbl]["corrects"].append(1.0 if r.get("is_correct") else 0.0)
+
+        ckpt_stats: Dict[str, Dict[str, float]] = {}
+        for lbl, d in dynamics_by_ckpt.items():
             probs = d["probs"]
             corrects = d["corrects"]
-            epoch_stats[ep] = {
+            ckpt_stats[lbl] = {
                 "mean_prob": sum(probs) / len(probs) if probs else 0.0,
                 "pass_rate": sum(corrects) / len(corrects) if corrects else 0.0,
             }
@@ -758,7 +779,7 @@ class TrainingReportGenerator:
                 time_series["eval_perplexities"],
                 time_series["lr_steps"],
                 time_series["learning_rates"],
-                epoch_stats,
+                ckpt_stats,
                 coordinates,
                 dashboard_png,
             )
@@ -767,13 +788,13 @@ class TrainingReportGenerator:
         # Generate Markdown Report
         # -------------------------------------------------------------
         md_path = self.output_dir / "training_report.md"
-        self._write_markdown_report(md_path, metrics, time_series, epoch_stats)
+        self._write_markdown_report(md_path, metrics, time_series, ckpt_stats)
 
         # -------------------------------------------------------------
         # Generate HTML Report
         # -------------------------------------------------------------
         html_path = self.output_dir / "training_report.html"
-        self._write_html_report(html_path, metrics, time_series, epoch_stats)
+        self._write_html_report(html_path, metrics, time_series, ckpt_stats)
 
         return {
             "output_dir": str(self.output_dir),
@@ -794,7 +815,7 @@ class TrainingReportGenerator:
         path: Path,
         m: Dict[str, Any],
         time_series: Dict[str, List[Any]],
-        epoch_stats: Dict[int, Dict[str, float]],
+        ckpt_stats: Dict[str, Dict[str, float]],
     ) -> None:
         model_name = self.config.get("model", {}).get("base_model_name", "Qwen/Qwen2.5-7B-Instruct")
         dataset_id = self.config.get("dataset", {}).get("repo_id", "CamiloEmiliano/yarnball-sft")
@@ -812,6 +833,7 @@ class TrainingReportGenerator:
         for s, l, p in zip(eval_steps, eval_losses, eval_ppls):
             status = "Optimal Checkpoint" if p == best_ppl else "Converging"
             eval_rows += f"| Step {s} | `{l:.4f}` | `{p:.3f}` | {status} |\n"
+        eval_rows_block = eval_rows if eval_rows else "| Step 0 | N/A | N/A | None |\n"
 
         content = f"""# YarnBall SFT Training Report: {model_name}
 
@@ -849,22 +871,22 @@ Perplexity represents the model's effective branching factor over target complet
 
 | Evaluation Step | Validation Loss | Validation Perplexity (PPL) | Status |
 | :--- | :--- | :--- | :--- |
-{eval_rows if eval_rows else "| Step 0 | N/A | N/A | None |\\n"}
+{eval_rows_block}
 
 ![Validation Perplexity Trajectory](plots/perplexity_curves.svg)
 
 ---
 
-## 4. Training Dynamics across Epochs
+## 4. Training Dynamics across Checkpoints
 
-| Epoch | Mean Target Seq Probability | Correctness Pass Rate (>= 70%) | Status |
+| Checkpoint | Mean Target Seq Probability | Correctness Pass Rate (>= 70%) | Status |
 | :--- | :--- | :--- | :--- |
 """
-        for ep in sorted(epoch_stats.keys()):
-            mean_p = epoch_stats[ep]["mean_prob"]
-            pass_r = epoch_stats[ep]["pass_rate"]
+        for lbl, stats in ckpt_stats.items():
+            mean_p = stats["mean_prob"]
+            pass_r = stats["pass_rate"]
             status = "Nominal" if pass_r >= 0.75 else "Converging"
-            content += f"| Epoch {ep} | `{mean_p:.4f}` | `{pass_r * 100:.2f}%` | {status} |\n"
+            content += f"| {lbl} | `{mean_p:.4f}` | `{pass_r * 100:.2f}%` | {status} |\n"
 
         content += f"""
 ---
@@ -889,7 +911,7 @@ Perplexity represents the model's effective branching factor over target complet
         path: Path,
         m: Dict[str, Any],
         time_series: Dict[str, List[Any]],
-        epoch_stats: Dict[int, Dict[str, float]],
+        ckpt_stats: Dict[str, Dict[str, float]],
     ) -> None:
         model_name = self.config.get("model", {}).get("base_model_name", "Qwen/Qwen2.5-7B-Instruct")
         dataset_id = self.config.get("dataset", {}).get("repo_id", "CamiloEmiliano/yarnball-sft")
@@ -898,8 +920,8 @@ Perplexity represents the model's effective branching factor over target complet
         dashboard_img_src = "plots/training_dashboard.png" if HAS_MATPLOTLIB else "plots/loss_curves.svg"
 
         epoch_rows = "".join([
-            f"<tr><td>Epoch {ep}</td><td><code>{epoch_stats[ep]['mean_prob']:.4f}</code></td><td><code>{epoch_stats[ep]['pass_rate'] * 100:.1f}%</code></td><td><span class='badge'>Converging</span></td></tr>"
-            for ep in sorted(epoch_stats.keys())
+            f"<tr><td>{lbl}</td><td><code>{ckpt_stats[lbl]['mean_prob']:.4f}</code></td><td><code>{ckpt_stats[lbl]['pass_rate'] * 100:.1f}%</code></td><td><span class='badge'>Converging</span></td></tr>"
+            for lbl in ckpt_stats.keys()
         ])
 
         eval_steps = time_series.get("eval_steps", [])

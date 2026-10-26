@@ -232,3 +232,7 @@ __marimo__/
 outputs/
 wandb/
 
+
+# Project Notes
+notes/
+
