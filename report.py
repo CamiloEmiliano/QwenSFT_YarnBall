@@ -446,10 +446,17 @@ class MatplotlibPlotter:
             lines1.extend(l3)
             labels1.append("Validation Loss")
 
-        ax1.set_title("Loss & Validation Perplexity Trajectory", fontsize=13, fontweight="bold", color="#d1d4dc")
+        ax1.set_yscale("log")
+        if train_losses or eval_losses:
+            all_l = (train_losses or []) + (eval_losses or [])
+            min_l = min(all_l)
+            max_l = max(all_l)
+            ax1.set_ylim(max(min_l * 0.5, 0.0004), max_l * 1.5)
+
+        ax1.set_title("Loss & Validation Perplexity Trajectory (Log Scale)", fontsize=13, fontweight="bold", color="#d1d4dc")
         ax1.set_xlabel("Optimization Step")
-        ax1.set_ylabel("Cross-Entropy Loss", color="#b2b5be")
-        ax1.grid(True)
+        ax1.set_ylabel("Cross-Entropy Loss (Log Scale)", color="#b2b5be")
+        ax1.grid(True, which="both", alpha=0.3)
 
         # Twin Y-Axis for Validation Perplexity
         if eval_steps and eval_perplexities:
@@ -551,11 +558,19 @@ class TrainingReportGenerator:
         self.config = config or {}
 
     def load_trainer_state(self) -> Dict[str, Any]:
-        """Locates and loads trainer_state.json from run directory."""
+        """Locates and loads trainer_state.json from run directory or checkpoints."""
         candidates = [
             self.run_dir / "trainer_state.json",
             self.run_dir.parent / "trainer_state.json",
         ]
+        # Search inside checkpoint subdirectories if not found in root
+        ckpt_dirs = sorted(
+            self.run_dir.glob("checkpoint-*"),
+            key=lambda p: int(p.name.split("-")[-1]) if p.name.split("-")[-1].isdigit() else 0,
+            reverse=True,
+        )
+        for cd in ckpt_dirs:
+            candidates.append(cd / "trainer_state.json")
         for p in candidates:
             if p.is_file():
                 try:
